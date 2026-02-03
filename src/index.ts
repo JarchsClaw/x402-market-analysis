@@ -1,6 +1,10 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express from 'express';
+import { paymentMiddleware } from '@x402/express';
+import { x402ResourceServer, HTTPFacilitatorClient } from '@x402/core/server';
+import { registerExactEvmScheme } from '@x402/evm/exact/server';
+import { bazaarResourceServerExtension, declareDiscoveryExtension } from '@x402/extensions/bazaar';
 import { config, isMainnet } from './config.js';
-import { paymentRoutes, serviceMetadata } from './routes.js';
+import { serviceMetadata } from './routes.js';
 import { getTokenPrice } from './services/price.service.js';
 import { analyzePortfolio } from './services/portfolio.service.js';
 import { generateTradingSignals } from './services/signals.service.js';
@@ -22,71 +26,153 @@ app.use((req, res, next) => {
 });
 
 // =============================================================================
-// x402 Payment Middleware
+// x402 Setup with Official SDK
 // =============================================================================
 
-/**
- * Simplified x402 payment middleware
- * In production, use @x402/express with full signature verification
- * This implementation shows the payment flow pattern
- */
-function x402PaymentMiddleware(routeConfig: typeof paymentRoutes) {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    // Build full path for matching (add /api prefix back since middleware is mounted at /api)
-    const fullPath = `/api${req.path}`;
-    
-    // Find matching route config (handle path params)
-    let matchedConfig: typeof routeConfig[string] | undefined;
-    for (const [key, cfg] of Object.entries(routeConfig)) {
-      const [method, path] = key.split(' ');
-      if (method === req.method) {
-        // Convert route pattern to regex (handle :param patterns)
-        const pathRegex = new RegExp('^' + path.replace(/:[^/]+/g, '[^/]+') + '$');
-        if (pathRegex.test(fullPath)) {
-          matchedConfig = cfg;
-          break;
-        }
-      }
-    }
-    
-    if (!matchedConfig) {
-      return next();
-    }
+// Create facilitator client
+const facilitatorClient = new HTTPFacilitatorClient({
+  url: config.facilitatorUrl,
+});
 
-    // Check for payment signature
-    const paymentSignature = req.headers['payment-signature'] || req.headers['x-payment'];
-    
-    if (!paymentSignature) {
-      // Return 402 Payment Required with payment instructions
-      res.status(402);
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Payment-Required', JSON.stringify({
-        x402Version: 2,
-        accepts: matchedConfig.accepts,
-        description: matchedConfig.description,
-        extensions: matchedConfig.extensions,
-      }));
-      
-      return res.json({
-        error: 'Payment Required',
-        message: 'This endpoint requires payment via x402 protocol',
-        x402Version: 2,
-        accepts: matchedConfig.accepts,
-        description: matchedConfig.description,
-        facilitator: config.facilitatorUrl,
-        network: config.network,
-        extensions: matchedConfig.extensions,
-      });
-    }
+// Create resource server and register extensions
+const server = new x402ResourceServer(facilitatorClient);
+registerExactEvmScheme(server);
+server.registerExtension(bazaarResourceServerExtension);
 
-    // In production, verify payment signature with facilitator
-    // For now, accept any non-empty signature (testnet behavior)
-    // TODO: Implement full verification with @x402/express
-    
-    console.log(`[x402] Payment received for ${req.method} ${fullPath}`);
-    next();
-  };
-}
+// =============================================================================
+// Route Configuration with Bazaar Discovery
+// =============================================================================
+
+const paymentRoutes = {
+  'GET /api/price': {
+    accepts: {
+      scheme: 'exact' as const,
+      price: config.pricing.tokenPrice,
+      network: config.network,
+      payTo: config.payToAddress,
+    },
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { symbol: 'ETH', chain: 'base' },
+        inputSchema: {
+          properties: {
+            symbol: { type: 'string', description: 'Token symbol (e.g., BTC, ETH, SOL)' },
+            contractAddress: { type: 'string', description: 'Token contract address' },
+            chain: { type: 'string', description: 'Blockchain (ethereum, base, arbitrum, polygon, solana)' },
+          },
+        },
+        output: {
+          example: {
+            success: true,
+            data: {
+              symbol: 'ETH',
+              name: 'Ethereum',
+              price: 3245.67,
+              priceChange24h: 45.23,
+              priceChangePercentage24h: 1.41,
+              marketCap: 389000000000,
+              volume24h: 12500000000,
+            },
+          },
+          schema: {
+            properties: {
+              success: { type: 'boolean' },
+              data: {
+                type: 'object',
+                properties: {
+                  symbol: { type: 'string' },
+                  name: { type: 'string' },
+                  price: { type: 'number' },
+                  priceChange24h: { type: 'number' },
+                  priceChangePercentage24h: { type: 'number' },
+                  marketCap: { type: 'number' },
+                  volume24h: { type: 'number' },
+                },
+              },
+            },
+          },
+        },
+      }),
+    },
+  },
+  'GET /api/portfolio/:address': {
+    accepts: {
+      scheme: 'exact' as const,
+      price: config.pricing.portfolioAnalysis,
+      network: config.network,
+      payTo: config.payToAddress,
+    },
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { address: '0x...', chain: 'base' },
+        inputSchema: {
+          properties: {
+            address: { type: 'string', description: 'Wallet address to analyze', pattern: '^0x[a-fA-F0-9]{40}$' },
+            chain: { type: 'string', description: 'Blockchain (defaults to base)' },
+          },
+          required: ['address'],
+        },
+        output: {
+          example: {
+            success: true,
+            data: {
+              walletAddress: '0x1234...5678',
+              totalValueUsd: 12500.50,
+              tokenCount: 8,
+              diversificationScore: 65,
+            },
+          },
+        },
+      }),
+    },
+  },
+  'GET /api/signals/:symbol': {
+    accepts: {
+      scheme: 'exact' as const,
+      price: config.pricing.tradingSignals,
+      network: config.network,
+      payTo: config.payToAddress,
+    },
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { symbol: 'ETH' },
+        inputSchema: {
+          properties: {
+            symbol: { type: 'string', description: 'Token symbol to analyze (e.g., BTC, ETH, SOL)' },
+          },
+          required: ['symbol'],
+        },
+        output: {
+          example: {
+            success: true,
+            data: {
+              symbol: 'ETH',
+              currentPrice: 3245.67,
+              overallSignal: 'buy',
+              confidence: 72,
+              trend: 'bullish',
+            },
+          },
+          schema: {
+            properties: {
+              success: { type: 'boolean' },
+              data: {
+                type: 'object',
+                properties: {
+                  symbol: { type: 'string' },
+                  currentPrice: { type: 'number' },
+                  overallSignal: { type: 'string', enum: ['strong_buy', 'buy', 'neutral', 'sell', 'strong_sell'] },
+                  confidence: { type: 'number' },
+                  trend: { type: 'string', enum: ['bullish', 'bearish', 'sideways'] },
+                },
+              },
+            },
+          },
+        },
+      }),
+    },
+  },
+};
 
 // =============================================================================
 // Health & Info Endpoints (Free)
@@ -118,24 +204,12 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// Discovery endpoint for Bazaar compatibility
-app.get('/x402/discovery', (req, res) => {
-  res.json({
-    x402Version: 2,
-    service: serviceMetadata,
-    routes: Object.entries(paymentRoutes).map(([key, cfg]) => ({
-      route: key,
-      ...cfg,
-    })),
-  });
-});
-
 // =============================================================================
-// Paid API Endpoints
+// Paid API Endpoints with Official x402 Middleware
 // =============================================================================
 
-// Apply x402 middleware to paid routes
-app.use('/api', x402PaymentMiddleware(paymentRoutes));
+// Apply official x402 payment middleware
+app.use(paymentMiddleware(paymentRoutes, server));
 
 // Token Price Checker
 app.get('/api/price', async (req, res) => {
@@ -239,19 +313,19 @@ app.get('/api/signals/:symbol', async (req, res) => {
 app.listen(config.port, () => {
   console.log(`
 ╔════════════════════════════════════════════════════════════════╗
-║         UPSKILL Market Analysis - x402 Enabled                ║
+║     UPSKILL Market Analysis - x402 Official SDK               ║
 ╠════════════════════════════════════════════════════════════════╣
-║  Server:     http://localhost:${config.port}                         ║
-║  Network:    ${config.network.padEnd(30)}         ║
-║  Mainnet:    ${String(isMainnet).padEnd(30)}         ║
-║  Facilitator: ${config.facilitatorUrl.padEnd(29)}║
+║  Server:      http://localhost:${config.port}                        ║
+║  Network:     ${config.network.padEnd(29)}         ║
+║  Mainnet:     ${String(isMainnet).padEnd(29)}         ║
+║  Facilitator: ${config.facilitatorUrl.padEnd(28)}║
 ╠════════════════════════════════════════════════════════════════╣
-║  Endpoints:                                                    ║
-║    GET /api/price?symbol=ETH          ${config.pricing.tokenPrice.padEnd(10)} per call   ║
-║    GET /api/portfolio/:address        ${config.pricing.portfolioAnalysis.padEnd(10)} per call   ║
-║    GET /api/signals/:symbol           ${config.pricing.tradingSignals.padEnd(10)} per call   ║
+║  Endpoints (Bazaar Discoverable):                              ║
+║    GET /api/price?symbol=ETH          ${config.pricing.tokenPrice.padEnd(9)} per call   ║
+║    GET /api/portfolio/:address        ${config.pricing.portfolioAnalysis.padEnd(9)} per call   ║
+║    GET /api/signals/:symbol           ${config.pricing.tradingSignals.padEnd(9)} per call   ║
 ╠════════════════════════════════════════════════════════════════╣
-║  Payment Wallet: ${config.payToAddress.slice(0, 20)}...    ║
+║  Payment Wallet: ${config.payToAddress.slice(0, 20)}...   ║
 ╚════════════════════════════════════════════════════════════════╝
   `);
 });
