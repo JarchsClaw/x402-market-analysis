@@ -4,8 +4,8 @@ dotenv.config();
 // Network type for x402
 type Network = `${string}:${string}`;
 
-// Default to Base mainnet for production
-const DEFAULT_NETWORK: Network = 'eip155:8453';
+// Default to Base Sepolia for x402.org facilitator - use env var for mainnet with CDP facilitator
+const DEFAULT_NETWORK: Network = 'eip155:84532';
 
 export const config = {
   port: parseInt(process.env.PORT || '4021', 10),
